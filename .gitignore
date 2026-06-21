@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+typeahead/backend/typeahead.db
+typeahead/backend/wal.log
+typeahead/backend/_raw_dataset_tmp/
+typeahead/frontend/node_modules/
+typeahead/frontend/dist/
+.DS_Store
