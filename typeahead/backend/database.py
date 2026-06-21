@@ -2,13 +2,27 @@
 everything else (in-memory cache, frequency_memory) is a rebuildable view of this."""
 import csv
 import sqlite3
+import threading
 from pathlib import Path
 
 DB_PATH = str(Path(__file__).parent / "typeahead.db")
 
+_local = threading.local()
+
 
 def get_connection():
-    return sqlite3.connect(DB_PATH)
+    """One persistent connection per thread, instead of opening a fresh
+    connection on every call. Also enables WAL mode + synchronous=NORMAL -
+    SQLite's default settings fsync() on every commit, which can stall
+    unpredictably for hundreds of milliseconds under concurrent load; WAL
+    mode avoids that by writing to a separate log file and only checkpointing
+    periodically, while still being durable across crashes."""
+    if not hasattr(_local, "conn"):
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        _local.conn = conn
+    return _local.conn
 
 
 def init_db():
