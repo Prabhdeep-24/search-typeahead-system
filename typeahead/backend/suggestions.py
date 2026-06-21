@@ -64,17 +64,46 @@ def _register_new_query(query):
 
 
 def update_cache(prefix):
-    """Recompute top 10 for prefix and store in the cache node it hashes to"""
+    """Recompute top 10 for prefix from scratch and store in the cache node it
+    hashes to. Used only as a fallback for a prefix the bottom-up build never
+    saw (e.g. one that only exists because of a brand-new query)."""
     server = ring.get_server(prefix)
     if server and server in cache_servers:
         cache_servers[server][prefix] = compute_top10(prefix)
 
 
+def _merge_update_cache(prefix, changed_queries):
+    """Recompute a prefix's top 10 by merging its EXISTING cached entry with
+    just the queries that changed this flush, instead of recomputing from the
+    full dataset. Correct because of the write-through invariant: the cache
+    is always already-accurate going into a flush, so any query not in the
+    old top 10 and not changed this flush still has the same count it had
+    before - it couldn't have newly entered the top 10. So the new true top
+    10 is guaranteed to be found within (old top 10) union (changed queries)."""
+    server = ring.get_server(prefix)
+    if not server or server not in cache_servers:
+        return
+
+    existing = cache_servers[server].get(prefix)
+    if existing is None:
+        # Genuinely new prefix the startup build never saw - full fallback.
+        cache_servers[server][prefix] = compute_top10(prefix)
+        return
+
+    candidates = {q: frequency_memory.get(q, 0) for q in existing}
+    for q in changed_queries:
+        candidates[q] = frequency_memory.get(q, 0)
+
+    top10 = heapq.nlargest(TOP_N, candidates.items(), key=lambda kv: kv[1])
+    cache_servers[server][prefix] = [q for q, _ in top10]
+
+
 def flush_buffer():
     """
     Swap out the write buffer, apply all deltas to SQLite in ONE transaction,
-    update frequency_memory, recompute cache for every affected prefix,
-    then clear the WAL since these deltas are now durably in SQLite.
+    update frequency_memory, then patch the cache for every affected prefix
+    via the cheap old-top10-plus-deltas merge above, then clear the WAL since
+    these deltas are now durably in SQLite.
     """
     with _buffer_lock:
         if not write_buffer:
@@ -87,21 +116,22 @@ def flush_buffer():
 
     update_counts_batch(deltas)
 
-    affected_prefixes = set()
+    prefix_to_changed = {}
     for query, delta in deltas.items():
         is_new = query not in frequency_memory
         frequency_memory[query] = frequency_memory.get(query, 0) + delta
         if is_new:
             _register_new_query(query)
-        affected_prefixes.update(get_prefixes(query))
+        for prefix in get_prefixes(query):
+            prefix_to_changed.setdefault(prefix, []).append(query)
 
-    for prefix in affected_prefixes:
-        update_cache(prefix)
+    for prefix, changed_queries in prefix_to_changed.items():
+        _merge_update_cache(prefix, changed_queries)
 
     clear_wal()
     print(
         f"Flushed {len(deltas)} queries ({sum(deltas.values())} total searches) "
-        f"-> 1 DB transaction, {len(affected_prefixes)} prefixes recomputed"
+        f"-> 1 DB transaction, {len(prefix_to_changed)} prefixes patched"
     )
 
 
@@ -125,7 +155,11 @@ def build_cache():
     Called on startup.
     1. Recover any unflushed searches from the WAL (crash recovery).
     2. Load all data from SQLite into frequency_memory.
-    3. Precompute ALL prefixes and populate cache servers.
+    3. Build the cache bottom-up: start from complete queries (the longest
+       "prefix" of anything is the query itself), then walk one character
+       shorter at a time, merging each prefix's top 10 from its own count
+       (if it's itself a complete query) plus its children's already-known
+       top 10 lists - never rescanning the full dataset at any prefix.
     """
     recovered = replay_wal()
     if recovered:
@@ -139,29 +173,67 @@ def build_cache():
     print("Sorting queries for fast prefix lookup...")
     sorted_queries.extend(sorted(frequency_memory.keys()))
 
-    print("Building cache (precomputing all prefixes)...")
-    all_prefixes = set()
-    for query in frequency_memory:
-        for prefix in get_prefixes(query):
-            all_prefixes.add(prefix)
+    if not frequency_memory:
+        print("Cache ready. 0 prefixes (empty dataset).")
+        return
 
-    for prefix in all_prefixes:
-        update_cache(prefix)
+    print("Building cache bottom-up (merging children prefixes upward)...")
 
-    print(f"Cache ready. {len(all_prefixes)} prefixes cached across {len(ring.servers)} servers.")
+    # Bucket queries by their own length so each one is injected as "the
+    # complete word at this prefix" exactly once, at its own length - O(N)
+    # total across the whole build, not re-scanned at every level.
+    length_buckets = {}
+    max_len = 0
+    for query, count in frequency_memory.items():
+        length_buckets.setdefault(len(query), []).append((query, count))
+        max_len = max(max_len, len(query))
+
+    next_level = {}  # prefix (length L+1) -> top10 [(query, count), ...] from the level below
+    total_prefixes = 0
+
+    for length in range(max_len, MIN_PREFIX_LENGTH - 1, -1):
+        # Group next_level's entries by their parent (this level's) prefix -
+        # this is the "merge from children" step, bounded by however many
+        # distinct next-characters actually occur, not by total matches.
+        candidates_by_prefix = {}
+        for child_prefix, child_top10 in next_level.items():
+            parent = child_prefix[:length]
+            candidates_by_prefix.setdefault(parent, []).extend(child_top10)
+
+        # A prefix that is itself a complete query also contributes its own
+        # count, in addition to whatever children it has (e.g. "iphone" is
+        # both a real query AND has children like "iphone 15").
+        for query, count in length_buckets.get(length, []):
+            candidates_by_prefix.setdefault(query, []).append((query, count))
+
+        current_level = {}
+        for prefix, candidates in candidates_by_prefix.items():
+            top10 = heapq.nlargest(TOP_N, candidates, key=lambda t: t[1])
+            current_level[prefix] = top10
+            server = ring.get_server(prefix)
+            if server and server in cache_servers:
+                cache_servers[server][prefix] = [q for q, _ in top10]
+            total_prefixes += 1
+
+        next_level = current_level
+
+    print(f"Cache ready. {total_prefixes} prefixes cached across {len(ring.servers)} servers.")
 
 
 def redistribute_cache():
-    """Called after adding/removing a server. Recomputes which server each
-    prefix belongs to, demonstrating that consistent hashing only moves ~1/N
-    of the keys instead of reshuffling everything."""
+    """Called after adding/removing a server. Adding/removing a server only
+    changes ROUTING (which server owns a prefix) - it never changes the
+    actual top-10 answer for any prefix - so we just re-bucket the existing,
+    already-correct cached entries into their new homes instead of
+    recomputing anything."""
+    old_entries = {}
+    for server_dict in cache_servers.values():
+        old_entries.update(server_dict)
+
     for server in cache_servers:
         cache_servers[server] = {}
 
-    all_prefixes = set()
-    for query in frequency_memory:
-        for prefix in get_prefixes(query):
-            all_prefixes.add(prefix)
-
-    for prefix in all_prefixes:
-        update_cache(prefix)
+    for prefix, top10 in old_entries.items():
+        server = ring.get_server(prefix)
+        if server and server in cache_servers:
+            cache_servers[server][prefix] = top10
