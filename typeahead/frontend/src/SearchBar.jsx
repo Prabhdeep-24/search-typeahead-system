@@ -6,7 +6,7 @@ const API_BASE = "http://localhost:8000";
 const DEBOUNCE_MS = 150;
 const MIN_PREFIX_LENGTH = 3;
 
-export default function SearchBar({ presetTerm }) {
+export default function SearchBar({ presetTerm, mode = "basic" }) {
   const [query, setQuery] = useState("");
   const [suggestions, setSuggestions] = useState([]);
   const [serverInfo, setServerInfo] = useState("");
@@ -20,7 +20,7 @@ export default function SearchBar({ presetTerm }) {
     try {
       setLoading(true);
       setError(null);
-      const res = await axios.get(`${API_BASE}/suggest`, { params: { q: value } });
+      const res = await axios.get(`${API_BASE}/suggest`, { params: { q: value, mode } });
       setSuggestions(res.data.suggestions);
       setServerInfo(res.data.server || "");
     } catch (err) {
@@ -59,6 +59,15 @@ export default function SearchBar({ presetTerm }) {
       fetchSuggestions(presetTerm.term);
     }
   }, [presetTerm]);
+
+  // Re-fetch suggestions for the current query when the mode toggle changes,
+  // so switching to "recency" updates the dropdown immediately.
+  useEffect(() => {
+    if (query.trim().length >= MIN_PREFIX_LENGTH) {
+      fetchSuggestions(query);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
 
   const handleSubmit = async (selectedQuery) => {
     const q = (selectedQuery ?? query).trim();

@@ -27,6 +27,31 @@
   font-size: 14px;
 }
 
+.mode-toggle {
+  display: inline-flex;
+  margin-top: 18px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px;
+  gap: 2px;
+}
+
+.mode-toggle button {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.mode-toggle button.active {
+  background: var(--accent);
+  color: white;
+}
+
 .app-main {
   flex: 1;
 }

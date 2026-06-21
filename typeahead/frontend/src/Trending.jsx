@@ -4,13 +4,13 @@ import axios from "axios";
 const API_BASE = "http://localhost:8000";
 const REFRESH_MS = 30000;
 
-export default function Trending({ onTermClick }) {
+export default function Trending({ onTermClick, mode = "basic" }) {
   const [trending, setTrending] = useState([]);
   const [error, setError] = useState(null);
 
   const fetchTrending = async () => {
     try {
-      const res = await axios.get(`${API_BASE}/trending`);
+      const res = await axios.get(`${API_BASE}/trending`, { params: { mode } });
       setTrending(res.data.trending);
       setError(null);
     } catch (err) {
@@ -22,7 +22,7 @@ export default function Trending({ onTermClick }) {
     fetchTrending();
     const interval = setInterval(fetchTrending, REFRESH_MS);
     return () => clearInterval(interval);
-  }, []);
+  }, [mode]);
 
   return (
     <section className="trending">

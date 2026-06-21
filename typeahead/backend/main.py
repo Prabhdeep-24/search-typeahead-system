@@ -8,12 +8,23 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from cache import ring
 from database import init_db, load_dataset
-from storage import cache_servers, cache_stats, frequency_memory, write_buffer
+from storage import (
+    cache_servers,
+    cache_stats,
+    frequency_memory,
+    last_tick_memory,
+    recency_memory,
+    write_buffer,
+)
 from suggestions import (
+    apply_global_decay,
     background_flush,
     build_cache,
     compute_top10,
+    compute_top10_recency,
     flush_buffer,
+    get_current_tick,
+    hybrid_score,
     maybe_flush_now,
     redistribute_cache,
     update_cache,
@@ -51,31 +62,38 @@ def startup():
 
 
 @app.get("/suggest")
-def suggest(q: str = ""):
+def suggest(q: str = "", mode: str = "basic"):
     """
     Returns top 10 suggestions for a prefix.
     - Lowercase + strip input
     - If length < 3, return []
-    - Get server from consistent hash ring
-    - Check cache -> hit: return; miss: compute, store, return
+    - mode="basic" (default): cached, sorted by all-time count - V1 behavior,
+      unchanged.
+    - mode="recency": V2 - sorted by hybrid_score (recency + a count floor),
+      computed live every call, never cached (see compute_top10_recency).
     - Handles empty, mixed-case, no-match gracefully
     """
     q = q.lower().strip()
     if not q or len(q) < 3:
-        return {"suggestions": [], "server": None, "cache_hit": False}
+        return {"suggestions": [], "server": None, "cache_hit": False, "mode": mode}
 
     server = ring.get_server(q)
+
+    if mode == "recency":
+        suggestions = compute_top10_recency(q)
+        return {"suggestions": suggestions, "server": server, "cache_hit": False, "mode": "recency"}
+
     cached = cache_servers.get(server, {}).get(q)
 
     if cached is not None:
         cache_stats["hits"] += 1
-        return {"suggestions": cached, "server": server, "cache_hit": True}
+        return {"suggestions": cached, "server": server, "cache_hit": True, "mode": "basic"}
 
     cache_stats["misses"] += 1
     suggestions = compute_top10(q)
     cache_servers[server][q] = suggestions
 
-    return {"suggestions": suggestions, "server": server, "cache_hit": False}
+    return {"suggestions": suggestions, "server": server, "cache_hit": False, "mode": "basic"}
 
 
 @app.post("/search")
@@ -123,11 +141,31 @@ def cache_debug(prefix: str = ""):
 
 
 @app.get("/trending")
-def trending():
+def trending(mode: str = "basic"):
     """Top 10 globally trending queries.
-    V1: by raw count. V2: by recency_score [ TO BE FILLED ]."""
-    sorted_queries = sorted(frequency_memory.items(), key=lambda kv: kv[1], reverse=True)
-    return {"trending": [q for q, _ in sorted_queries[:10]]}
+    mode="basic" (default): by all-time count - V1 behavior, unchanged.
+    mode="recency": V2 - by hybrid_score (recency-weighted), computed live."""
+    if mode == "recency":
+        ranked = sorted(frequency_memory.keys(), key=hybrid_score, reverse=True)
+    else:
+        ranked = [q for q, _ in sorted(frequency_memory.items(), key=lambda kv: kv[1], reverse=True)]
+    return {"trending": ranked[:10], "mode": mode}
+
+
+@app.post("/decay")
+def decay():
+    """
+    V2: manually trigger a global decay sweep.
+
+    Recency scores normally decay lazily - only recomputed when a query is
+    actually searched again (see flush_buffer). A query nobody has searched
+    in a while just sits at its last-computed value until touched. This
+    endpoint forces every query's stored recency_score to catch up to the
+    current tick, useful for demoing/inspecting the decay behavior directly
+    rather than waiting for organic search traffic to trigger it.
+    """
+    updated = apply_global_decay()
+    return {"status": "decayed", "queries_updated": updated}
 
 
 @app.get("/servers/status")
@@ -183,6 +221,22 @@ def remove_server(name: str):
         "status": "removed",
         "server": name,
         "distribution": ring.get_distribution(),
+    }
+
+
+@app.get("/recency/debug")
+def recency_debug(query: str = ""):
+    """V2 debug endpoint: shows the raw count, recency_score, and resulting
+    hybrid_score for a single query - useful for demoing decay live (search
+    something repeatedly, watch recency_score climb; stop, watch it fade)."""
+    query = query.lower().strip()
+    return {
+        "query": query,
+        "count": frequency_memory.get(query, 0),
+        "recency_score": recency_memory.get(query, 0),
+        "hybrid_score": hybrid_score(query),
+        "last_tick": last_tick_memory.get(query, 0),
+        "current_tick": get_current_tick(),
     }
 
 

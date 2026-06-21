@@ -25,3 +25,11 @@ sorted_queries = []
 
 # Cache hit/miss counters for the performance report
 cache_stats = {"hits": 0, "misses": 0}
+
+# V2 (recency-aware ranking): query -> decayed recency score, and the tick
+# (30s wall-clock bucket) it was last updated at. Mirrors recency_score/
+# last_tick in SQLite. Never cached in cache_servers - recomputed live on
+# every request, since it can change purely from time passing, not just
+# from new searches (see compute_top10_recency in suggestions.py).
+recency_memory = {}
+last_tick_memory = {}

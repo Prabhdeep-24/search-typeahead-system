@@ -26,14 +26,27 @@ def get_connection():
 
 
 def init_db():
-    """Create tables if they don't exist"""
+    """Create tables if they don't exist. recency_score/last_tick are the
+    V2 (recency-aware ranking) columns - added via ALTER TABLE for older
+    on-disk databases that predate them, swallowing the "duplicate column"
+    error if they're already present."""
     with get_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS frequency (
                 query TEXT PRIMARY KEY,
-                count INTEGER DEFAULT 0
+                count INTEGER DEFAULT 0,
+                recency_score REAL DEFAULT 0,
+                last_tick INTEGER DEFAULT 0
             )
         """)
+        for ddl in (
+            "ALTER TABLE frequency ADD COLUMN recency_score REAL DEFAULT 0",
+            "ALTER TABLE frequency ADD COLUMN last_tick INTEGER DEFAULT 0",
+        ):
+            try:
+                conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.commit()
 
 
@@ -73,6 +86,16 @@ def get_all_queries():
     return {row[0]: row[1] for row in rows}
 
 
+def get_all_queries_with_recency():
+    """V2: load query, count, recency_score, last_tick - used to populate
+    frequency_memory/recency_memory/last_tick_memory together at startup."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT query, count, recency_score, last_tick FROM frequency"
+        ).fetchall()
+    return rows
+
+
 def update_count(query, increment):
     """Apply a buffered delta to SQLite (called on flush)"""
     with get_connection() as conn:
@@ -98,6 +121,44 @@ def update_counts_batch(deltas: dict):
             ON CONFLICT(query) DO UPDATE SET count = count + ?
             """,
             [(query, delta, delta) for query, delta in deltas.items()],
+        )
+        conn.commit()
+
+
+def update_counts_and_recency_batch(updates: dict):
+    """V2: like update_counts_batch, but also persists the freshly-decayed
+    recency_score and last_tick for each query, in the same single
+    transaction. updates: {query: (count_delta, new_recency_score, tick)}."""
+    if not updates:
+        return
+    with get_connection() as conn:
+        conn.executemany(
+            """
+            INSERT INTO frequency (query, count, recency_score, last_tick)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(query) DO UPDATE SET
+                count = count + ?,
+                recency_score = ?,
+                last_tick = ?
+            """,
+            [
+                (query, delta, recency, tick, delta, recency, tick)
+                for query, (delta, recency, tick) in updates.items()
+            ],
+        )
+        conn.commit()
+
+
+def update_recency_only_batch(updates: dict):
+    """V2: used by the manual /decay sweep, which decays queries that were
+    NOT necessarily searched this round - so there's no count delta to apply,
+    only a refreshed recency_score/last_tick."""
+    if not updates:
+        return
+    with get_connection() as conn:
+        conn.executemany(
+            "UPDATE frequency SET recency_score = ?, last_tick = ? WHERE query = ?",
+            [(recency, tick, query) for query, (recency, tick) in updates.items()],
         )
         conn.commit()
 

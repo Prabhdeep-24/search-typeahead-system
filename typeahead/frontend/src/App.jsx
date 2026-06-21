@@ -7,6 +7,7 @@ import "./App.css";
 export default function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [presetTerm, setPresetTerm] = useState(null);
+  const [mode, setMode] = useState("basic");
 
   useEffect(() => {
     const interval = setInterval(() => setRefreshKey((k) => k + 1), 5000);
@@ -22,11 +23,25 @@ export default function App() {
       <header className="app-header">
         <h1>Search Typeahead</h1>
         <p className="subtitle">Distributed cache · consistent hashing · batch writes</p>
+        <div className="mode-toggle">
+          <button
+            className={mode === "basic" ? "active" : ""}
+            onClick={() => setMode("basic")}
+          >
+            Basic (all-time count)
+          </button>
+          <button
+            className={mode === "recency" ? "active" : ""}
+            onClick={() => setMode("recency")}
+          >
+            Recency-aware
+          </button>
+        </div>
       </header>
 
       <main className="app-main">
-        <SearchBar presetTerm={presetTerm} />
-        <Trending onTermClick={handleTrendingClick} />
+        <SearchBar presetTerm={presetTerm} mode={mode} />
+        <Trending onTermClick={handleTrendingClick} mode={mode} />
       </main>
 
       <Stats refreshKey={refreshKey} />

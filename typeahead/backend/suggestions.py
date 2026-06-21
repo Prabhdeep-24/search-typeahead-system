@@ -1,14 +1,32 @@
 """Core suggestion logic: compute, cache, flush.
 Write-through invalidation - flush_query immediately recomputes affected prefixes,
-so the cache is always accurate after every flush."""
+so the cache is always accurate after every flush.
+
+V2 (recency-aware ranking): a separate, parallel ranking signal on top of the
+same data. Never cached in cache_servers - see compute_top10_recency below for
+why - so none of the existing build/flush cache machinery above needed to
+change to support it; only the recency_memory/last_tick_memory bookkeeping
+is new."""
 import bisect
 import heapq
 import threading
 import time
 
 from cache import ring
-from database import get_all_queries, update_counts_batch
-from storage import cache_servers, frequency_memory, sorted_queries, write_buffer
+from database import (
+    get_all_queries_with_recency,
+    update_counts_and_recency_batch,
+    update_counts_batch,
+    update_recency_only_batch,
+)
+from storage import (
+    cache_servers,
+    frequency_memory,
+    last_tick_memory,
+    recency_memory,
+    sorted_queries,
+    write_buffer,
+)
 from wal import clear_wal, replay_wal
 
 MIN_PREFIX_LENGTH = 3
@@ -16,7 +34,28 @@ TOP_N = 10
 BUFFER_SIZE_THRESHOLD = 100
 FLUSH_INTERVAL_SECONDS = 5
 
+# V2 recency tuning. Tick = 30s wall-clock bucket, derived from time.time()
+# directly rather than a manual counter, so it's always correct even across
+# restarts. DECAY_FACTOR is applied once per elapsed tick since a query was
+# last touched - a search's contribution to recency_score halves roughly
+# every ~7 ticks (~3.5 minutes), fast enough to watch decay live in a demo.
+TICK_SECONDS = 30
+DECAY_FACTOR = 0.9
+COUNT_WEIGHT = 0.01  # all-time count's weight as a tie-breaker/floor in the hybrid score
+
 _buffer_lock = threading.Lock()
+
+
+def get_current_tick():
+    return int(time.time() // TICK_SECONDS)
+
+
+def hybrid_score(query):
+    """recency_score + a small fraction of all-time count. Recency dominates
+    (so genuinely fresh activity wins), but count acts as a floor/tie-breaker
+    so historically popular-but-quiet queries don't tie at exactly 0 with
+    everything else that's never been searched live."""
+    return recency_memory.get(query, 0) + COUNT_WEIGHT * frequency_memory.get(query, 0)
 
 # Character used to build the upper bound of a prefix's range in sorted_queries.
 # Any real query string sorts below "<prefix> + this char" since it's higher
@@ -52,6 +91,37 @@ def compute_top10(prefix):
     candidates = sorted_queries[lo:hi]
     top = heapq.nlargest(TOP_N, candidates, key=lambda q: frequency_memory.get(q, 0))
     return top
+
+
+def compute_top10_recency(prefix):
+    """V2: rank by hybrid_score (recency_score + a fraction of count).
+
+    Computed LIVE on every call, never cached - unlike count, a recency score
+    can change purely because time passed, with no new search happening at
+    all. Caching it would mean either re-deriving on every read anyway (no
+    benefit) or serving silently stale rankings with no write event to ever
+    trigger a refresh. The underlying lookup (binary-search range here) is
+    already cheap, so there's nothing to gain from caching it.
+
+    Returns recency-ranked winners first, then "stable fill" (plain count
+    order) for any remaining slots - so a prefix nobody has searched live
+    yet still returns a full, sensibly-ordered list instead of empty/ties."""
+    lo, hi = _prefix_range(prefix)
+    if lo == hi:
+        return []
+    candidates = sorted_queries[lo:hi]
+
+    recency_ranked = heapq.nlargest(TOP_N, candidates, key=hybrid_score)
+    if len(recency_ranked) >= TOP_N:
+        return recency_ranked
+
+    seen = set(recency_ranked)
+    remaining_needed = TOP_N - len(recency_ranked)
+    stable_pool = [q for q in candidates if q not in seen]
+    stable_fill = heapq.nlargest(
+        remaining_needed, stable_pool, key=lambda q: frequency_memory.get(q, 0)
+    )
+    return recency_ranked + stable_fill
 
 
 def _register_new_query(query):
@@ -98,12 +168,28 @@ def _merge_update_cache(prefix, changed_queries):
     cache_servers[server][prefix] = [q for q, _ in top10]
 
 
+def _decay_recency(query, current_tick):
+    """Apply DECAY_FACTOR once per elapsed tick since this query's
+    recency_score was last touched, lazily - only computed when the query is
+    actually flushed, not on a global timer. A query nobody has searched in a
+    while simply sits at whatever it decayed to the last time it WAS touched;
+    its true current value is always derivable from (old score, ticks since),
+    so there's no need to eagerly update everything on every tick."""
+    ticks_passed = current_tick - last_tick_memory.get(query, 0)
+    old_score = recency_memory.get(query, 0)
+    return old_score * (DECAY_FACTOR**ticks_passed) if ticks_passed > 0 else old_score
+
+
 def flush_buffer():
     """
     Swap out the write buffer, apply all deltas to SQLite in ONE transaction,
     update frequency_memory, then patch the cache for every affected prefix
     via the cheap old-top10-plus-deltas merge above, then clear the WAL since
     these deltas are now durably in SQLite.
+
+    Also decays and refreshes each changed query's recency_score (V2) in the
+    same pass, using the same batch of deltas - one mechanism driving both
+    the count-based cache and the recency signal.
     """
     with _buffer_lock:
         if not write_buffer:
@@ -114,16 +200,24 @@ def flush_buffer():
     if not deltas:
         return
 
-    update_counts_batch(deltas)
-
+    current_tick = get_current_tick()
+    db_updates = {}  # query -> (count_delta, new_recency_score, tick)
     prefix_to_changed = {}
     for query, delta in deltas.items():
         is_new = query not in frequency_memory
         frequency_memory[query] = frequency_memory.get(query, 0) + delta
         if is_new:
             _register_new_query(query)
+
+        new_recency = _decay_recency(query, current_tick) + delta
+        recency_memory[query] = new_recency
+        last_tick_memory[query] = current_tick
+        db_updates[query] = (delta, new_recency, current_tick)
+
         for prefix in get_prefixes(query):
             prefix_to_changed.setdefault(prefix, []).append(query)
+
+    update_counts_and_recency_batch(db_updates)
 
     for prefix, changed_queries in prefix_to_changed.items():
         _merge_update_cache(prefix, changed_queries)
@@ -133,6 +227,28 @@ def flush_buffer():
         f"Flushed {len(deltas)} queries ({sum(deltas.values())} total searches) "
         f"-> 1 DB transaction, {len(prefix_to_changed)} prefixes patched"
     )
+
+
+def apply_global_decay():
+    """Manual /decay sweep: unlike the lazy per-query decay above (which only
+    runs when a query is actually searched again), this walks every query
+    that has a non-zero recency_score and decays it based on elapsed ticks,
+    even ones nobody has searched recently. Lazy decay alone never "catches
+    up" a quiet query's stored score until someone searches it again; this
+    gives an explicit, on-demand way to see the global recency picture
+    reflect the current moment, useful for demoing the decay behavior."""
+    current_tick = get_current_tick()
+    db_updates = {}  # query -> (new_recency_score, tick)
+    for query in list(recency_memory.keys()):
+        if recency_memory.get(query, 0) == 0:
+            continue
+        new_score = _decay_recency(query, current_tick)
+        recency_memory[query] = new_score
+        last_tick_memory[query] = current_tick
+        db_updates[query] = (new_score, current_tick)
+
+    update_recency_only_batch(db_updates)
+    return len(db_updates)
 
 
 def background_flush():
@@ -168,7 +284,10 @@ def build_cache():
         clear_wal()
 
     print("Loading data from SQLite into memory...")
-    frequency_memory.update(get_all_queries())
+    for query, count, recency, last_tick in get_all_queries_with_recency():
+        frequency_memory[query] = count
+        recency_memory[query] = recency
+        last_tick_memory[query] = last_tick
 
     print("Sorting queries for fast prefix lookup...")
     sorted_queries.extend(sorted(frequency_memory.keys()))
