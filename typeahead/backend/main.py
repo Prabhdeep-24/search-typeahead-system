@@ -11,6 +11,7 @@ from database import init_db, load_dataset
 from storage import (
     cache_servers,
     cache_stats,
+    cache_topology_lock,
     frequency_memory,
     last_tick_memory,
     recency_memory,
@@ -91,7 +92,9 @@ def suggest(q: str = "", mode: str = "basic"):
 
     cache_stats["misses"] += 1
     suggestions = compute_top10(q)
-    cache_servers[server][q] = suggestions
+    with cache_topology_lock:
+        if server in cache_servers:
+            cache_servers[server][q] = suggestions
 
     return {"suggestions": suggestions, "server": server, "cache_hit": False, "mode": "basic"}
 
@@ -193,12 +196,13 @@ def servers_status():
 @app.post("/servers/add")
 def add_server(name: str):
     """Add a new cache server to the ring. Only ~1/N prefixes should move."""
-    if name in ring.servers:
-        return {"status": "already exists"}
+    with cache_topology_lock:
+        if name in ring.servers:
+            return {"status": "already exists"}
 
-    cache_servers[name] = {}
-    ring.add_server(name)
-    redistribute_cache()
+        cache_servers[name] = {}
+        ring.add_server(name)
+        redistribute_cache()
 
     return {
         "status": "added",
@@ -215,12 +219,13 @@ def remove_server(name: str):
     entry is deleted from cache_servers, since it reads every existing
     server's entries to redistribute them. Deleting first would silently
     drop everything that was cached on this server."""
-    if name not in ring.servers:
-        return {"status": "not found"}
+    with cache_topology_lock:
+        if name not in ring.servers:
+            return {"status": "not found"}
 
-    ring.remove_server(name)
-    redistribute_cache()
-    del cache_servers[name]
+        ring.remove_server(name)
+        redistribute_cache()
+        del cache_servers[name]
 
     return {
         "status": "removed",

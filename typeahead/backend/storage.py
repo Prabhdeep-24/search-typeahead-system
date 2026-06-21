@@ -1,5 +1,6 @@
 """In-memory state. Everything here is derived from SQLite and safe to lose/rebuild on restart,
 except write_buffer (protected by the write-ahead log in wal.py)."""
+import threading
 
 # Sharded cache - each server is a Python dictionary
 # Key: prefix (str), Value: list of top 10 suggestions
@@ -8,6 +9,14 @@ cache_servers = {
     "server2": {},
     "server3": {},
 }
+
+# Guards every direct write into cache_servers (a cache-miss fill, a flush's
+# patch, or a topology change), AND redistribute_cache()'s full rebuild.
+# redistribute_cache() replaces cache_servers[server] with a brand-new dict
+# object - a concurrent write landing on the OLD dict object right as that
+# swap happens is silently lost (no crash, just a dropped cache entry).
+# Confirmed via a concurrent-admin-op stress test before this lock existed.
+cache_topology_lock = threading.Lock()
 
 # Write buffer - holds pending counts before flushing to SQLite
 # Key: query (str), Value: pending count (int)

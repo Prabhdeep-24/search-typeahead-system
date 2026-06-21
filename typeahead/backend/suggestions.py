@@ -21,6 +21,7 @@ from database import (
 )
 from storage import (
     cache_servers,
+    cache_topology_lock,
     frequency_memory,
     last_tick_memory,
     recency_memory,
@@ -136,10 +137,16 @@ def _register_new_query(query):
 def update_cache(prefix):
     """Recompute top 10 for prefix from scratch and store in the cache node it
     hashes to. Used only as a fallback for a prefix the bottom-up build never
-    saw (e.g. one that only exists because of a brand-new query)."""
+    saw (e.g. one that only exists because of a brand-new query).
+
+    Locked: redistribute_cache() replaces cache_servers[server] with a brand
+    new dict object when a server is added/removed - a write landing on the
+    old dict object right as that swap happens would be silently lost."""
     server = ring.get_server(prefix)
-    if server and server in cache_servers:
-        cache_servers[server][prefix] = compute_top10(prefix)
+    top10 = compute_top10(prefix)
+    with cache_topology_lock:
+        if server and server in cache_servers:
+            cache_servers[server][prefix] = top10
 
 
 def _merge_update_cache(prefix, changed_queries):
@@ -149,23 +156,29 @@ def _merge_update_cache(prefix, changed_queries):
     is always already-accurate going into a flush, so any query not in the
     old top 10 and not changed this flush still has the same count it had
     before - it couldn't have newly entered the top 10. So the new true top
-    10 is guaranteed to be found within (old top 10) union (changed queries)."""
+    10 is guaranteed to be found within (old top 10) union (changed queries).
+
+    Locked for the same reason as update_cache above - see its docstring."""
     server = ring.get_server(prefix)
-    if not server or server not in cache_servers:
+    if not server:
         return
 
-    existing = cache_servers[server].get(prefix)
-    if existing is None:
-        # Genuinely new prefix the startup build never saw - full fallback.
-        cache_servers[server][prefix] = compute_top10(prefix)
-        return
+    with cache_topology_lock:
+        if server not in cache_servers:
+            return
 
-    candidates = {q: frequency_memory.get(q, 0) for q in existing}
-    for q in changed_queries:
-        candidates[q] = frequency_memory.get(q, 0)
+        existing = cache_servers[server].get(prefix)
+        if existing is None:
+            # Genuinely new prefix the startup build never saw - full fallback.
+            cache_servers[server][prefix] = compute_top10(prefix)
+            return
 
-    top10 = heapq.nlargest(TOP_N, candidates.items(), key=lambda kv: kv[1])
-    cache_servers[server][prefix] = [q for q, _ in top10]
+        candidates = {q: frequency_memory.get(q, 0) for q in existing}
+        for q in changed_queries:
+            candidates[q] = frequency_memory.get(q, 0)
+
+        top10 = heapq.nlargest(TOP_N, candidates.items(), key=lambda kv: kv[1])
+        cache_servers[server][prefix] = [q for q, _ in top10]
 
 
 def _decay_recency(query, current_tick):
@@ -344,7 +357,11 @@ def redistribute_cache():
     changes ROUTING (which server owns a prefix) - it never changes the
     actual top-10 answer for any prefix - so we just re-bucket the existing,
     already-correct cached entries into their new homes instead of
-    recomputing anything."""
+    recomputing anything.
+
+    Caller MUST already hold cache_topology_lock (main.py's add_server/
+    remove_server do) - this function does NOT acquire it itself, since it's
+    a plain Lock (not reentrant) and its only callers already hold it."""
     old_entries = {}
     for server_dict in cache_servers.values():
         old_entries.update(server_dict)
