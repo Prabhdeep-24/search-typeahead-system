@@ -6,3 +6,8 @@ typeahead/backend/_raw_dataset_tmp/
 typeahead/frontend/node_modules/
 typeahead/frontend/dist/
 .DS_Store
+typeahead/backend/typeahead.db-wal
+typeahead/backend/typeahead.db-shm
+typeahead/backend/server*.log
+typeahead/backend/venv/
+.claude/

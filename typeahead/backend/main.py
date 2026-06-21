@@ -209,13 +209,18 @@ def add_server(name: str):
 
 @app.post("/servers/remove")
 def remove_server(name: str):
-    """Remove a cache server from the ring. Remaining prefixes redistribute."""
+    """Remove a cache server from the ring. Remaining prefixes redistribute.
+
+    Order matters here: redistribute_cache() must run BEFORE the server's
+    entry is deleted from cache_servers, since it reads every existing
+    server's entries to redistribute them. Deleting first would silently
+    drop everything that was cached on this server."""
     if name not in ring.servers:
         return {"status": "not found"}
 
     ring.remove_server(name)
-    del cache_servers[name]
     redistribute_cache()
+    del cache_servers[name]
 
     return {
         "status": "removed",
