@@ -14,21 +14,20 @@ from storage import (
     cache_topology_lock,
     frequency_memory,
     last_tick_memory,
+    recency_cache_servers,
     recency_memory,
     write_buffer,
 )
 from suggestions import (
     apply_global_decay,
+    background_decay_refresh,
     background_flush,
     build_cache,
-    compute_top10,
-    compute_top10_recency,
     flush_buffer,
     get_current_tick,
     hybrid_score,
     maybe_flush_now,
     redistribute_cache,
-    update_cache,
 )
 from wal import append_to_wal
 
@@ -58,8 +57,8 @@ def startup():
     # that this drops max /suggest latency from ~640ms to ~34ms.
     gc.collect()
     gc.freeze()
-    thread = threading.Thread(target=background_flush, daemon=True)
-    thread.start()
+    threading.Thread(target=background_flush, daemon=True).start()
+    threading.Thread(target=background_decay_refresh, daemon=True).start()
 
 
 @app.get("/suggest")
@@ -68,10 +67,11 @@ def suggest(q: str = "", mode: str = "basic"):
     Returns top 10 suggestions for a prefix.
     - Lowercase + strip input
     - If length < 3, return []
-    - mode="basic" (default): cached, sorted by all-time count - V1 behavior,
-      unchanged.
-    - mode="recency": V2 - sorted by hybrid_score (recency + a count floor),
-      computed live every call, never cached (see compute_top10_recency).
+    - mode="basic" (default): cached (cache_servers), sorted by all-time
+      count - V1 behavior, unchanged.
+    - mode="recency": V2 - cached (recency_cache_servers), sorted by
+      hybrid_score (recency + a count floor). Built/patched the same way as
+      basic mode, plus a periodic background re-sort to account for decay.
     - Handles empty, mixed-case, no-match gracefully
     """
     q = q.lower().strip()
@@ -81,8 +81,13 @@ def suggest(q: str = "", mode: str = "basic"):
     server = ring.get_server(q)
 
     if mode == "recency":
-        suggestions = compute_top10_recency(q)
-        return {"suggestions": suggestions, "server": server, "cache_hit": False, "mode": "recency"}
+        cached = recency_cache_servers.get(server, {}).get(q)
+        return {
+            "suggestions": cached if cached is not None else [],
+            "server": server,
+            "cache_hit": cached is not None,
+            "mode": "recency",
+        }
 
     cached = cache_servers.get(server, {}).get(q)
 
@@ -90,13 +95,15 @@ def suggest(q: str = "", mode: str = "basic"):
         cache_stats["hits"] += 1
         return {"suggestions": cached, "server": server, "cache_hit": True, "mode": "basic"}
 
+    # A miss here only happens for a prefix that belongs exclusively to a
+    # query submitted but not yet flushed - build_cache and every flush's
+    # merge-patch already guarantee a cache entry for any prefix of anything
+    # that's actually been persisted. There's nothing to search for: this
+    # branch always resolves to an empty list. It'll get a real cached
+    # answer (or join the changed-queries fallback in _merge_update_cache)
+    # once its flush happens.
     cache_stats["misses"] += 1
-    suggestions = compute_top10(q)
-    with cache_topology_lock:
-        if server in cache_servers:
-            cache_servers[server][q] = suggestions
-
-    return {"suggestions": suggestions, "server": server, "cache_hit": False, "mode": "basic"}
+    return {"suggestions": [], "server": server, "cache_hit": False, "mode": "basic"}
 
 
 @app.post("/search")
@@ -195,12 +202,14 @@ def servers_status():
 
 @app.post("/servers/add")
 def add_server(name: str):
-    """Add a new cache server to the ring. Only ~1/N prefixes should move."""
+    """Add a new cache server to the ring. Only ~1/N prefixes should move.
+    Adds the new server to BOTH caches (basic and recency)."""
     with cache_topology_lock:
         if name in ring.servers:
             return {"status": "already exists"}
 
         cache_servers[name] = {}
+        recency_cache_servers[name] = {}
         ring.add_server(name)
         redistribute_cache()
 
@@ -213,12 +222,13 @@ def add_server(name: str):
 
 @app.post("/servers/remove")
 def remove_server(name: str):
-    """Remove a cache server from the ring. Remaining prefixes redistribute.
+    """Remove a cache server from the ring. Remaining prefixes redistribute
+    in BOTH caches.
 
     Order matters here: redistribute_cache() must run BEFORE the server's
-    entry is deleted from cache_servers, since it reads every existing
-    server's entries to redistribute them. Deleting first would silently
-    drop everything that was cached on this server."""
+    entry is deleted from cache_servers/recency_cache_servers, since it
+    reads every existing server's entries to redistribute them. Deleting
+    first would silently drop everything that was cached on this server."""
     with cache_topology_lock:
         if name not in ring.servers:
             return {"status": "not found"}
@@ -226,6 +236,7 @@ def remove_server(name: str):
         ring.remove_server(name)
         redistribute_cache()
         del cache_servers[name]
+        del recency_cache_servers[name]
 
     return {
         "status": "removed",

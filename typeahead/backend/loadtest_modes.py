@@ -14,7 +14,7 @@ import time
 import httpx
 
 API_BASE = "http://127.0.0.1:8000"
-DURATION_SECONDS = 15
+DURATION_SECONDS = 45
 WORKERS_PER_GROUP = 8
 
 with open("dataset.csv", encoding="utf-8") as f:
