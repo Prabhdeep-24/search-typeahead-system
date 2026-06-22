@@ -2,13 +2,18 @@
 Write-through invalidation - flush_query immediately recomputes affected prefixes,
 so the cache is always accurate after every flush.
 
-V2 (recency-aware ranking): a second, parallel cache (recency_cache_servers),
-built and patched the SAME way as the basic one - bottom-up merge at startup,
-delta-merge on flush - just ranked by hybrid_score instead of raw count. The
-one thing per-flush merging alone can't catch is decay: recency_score shrinks
-purely from time passing, with no write to react to. background_decay_refresh
-covers that case with a periodic re-sort of each prefix's EXISTING candidates
-(no search needed - see its docstring for why that's sufficient)."""
+V2 (recency-aware ranking): TWO lists merged at serve time, not one list.
+cache_servers is the "stable" list - ranked by all-time count, exactly like
+V1, provably safe to maintain incrementally (count never decreases).
+recency_cache_servers is the "trending" list - small, often EMPTY, holding
+only queries with a currently-meaningful (non-decayed-away) recency_score
+for that prefix. main.py merges trending + stable at request time, deduped,
+so a query that gets temporarily outranked by something trending and drops
+out of the trending list is never lost - it's still sitting in the stable
+list the whole time, and naturally resurfaces once the trending entry
+decays below it. The trending list needs no scan-fallback at all (unlike
+the stable list): "nothing is trending here" is always a valid, correct
+answer, never a "missing data" state."""
 import heapq
 import threading
 import time
@@ -66,6 +71,13 @@ TICK_SECONDS = 30
 DECAY_FACTOR = 0.9
 COUNT_WEIGHT = 0.01  # all-time count's weight as a tie-breaker/floor in the hybrid score
 
+# A query's recency_score decays asymptotically toward 0 but never hits it
+# exactly - below this, it's no longer meaningfully "trending" and gets
+# pruned out of the trending list entirely (see _merge_update_trending_cache
+# / refresh_recency_cache). The stable list (cache_servers) still has it -
+# this only controls when it stops getting a trending-list boost.
+RECENCY_PRUNE_THRESHOLD = 0.5
+
 _buffer_lock = threading.Lock()
 
 
@@ -98,65 +110,19 @@ def compute_top10_via_scan(prefix):
     the result into the cache, so every subsequent request for the same
     prefix is an instant hit afterward.
 
-    Used directly by main.py's live basic-mode miss path, where only the
-    count ranking is needed. background_scan_fill uses
-    compute_top10_both_via_scan instead, since it usually needs both
-    rankings and they're cheaper to compute together."""
+    This is the ONLY scan-fallback in the system - it only ever fills
+    cache_servers (the stable list). The trending list (recency_cache_servers)
+    never needs a scan: an empty trending list is always a correct answer,
+    never "missing data" - see the module docstring."""
     matches = [(q, c) for q, c in frequency_memory.items() if q.startswith(prefix)]
     top10 = heapq.nlargest(TOP_N, matches, key=itemgetter(1))
     return [q for q, _ in top10]
 
 
-def compute_top10_recency_via_scan(prefix):
-    """Same fallback as compute_top10_via_scan, ranked by hybrid_score - used
-    directly by main.py's live recency-mode miss path. hybrid_score is a
-    pure read of recency_memory/frequency_memory here, exactly like
-    everywhere else - this never decays or writes a recency score itself,
-    it only ranks by whatever the current value already is."""
-    matches = [(q, hybrid_score(q)) for q in frequency_memory if q.startswith(prefix)]
-    top10 = heapq.nlargest(TOP_N, matches, key=itemgetter(1))
-    return [q for q, _ in top10]
-
-
-def compute_top10_both_via_scan(prefix):
-    """Like compute_top10_via_scan + compute_top10_recency_via_scan
-    combined into a single pass over frequency_memory, instead of scanning
-    the same ~300k records twice. Used by background_scan_fill, which
-    usually needs both rankings for the same never-cached prefix anyway."""
-    count_candidates = []
-    recency_candidates = []
-    for q, c in frequency_memory.items():
-        if q.startswith(prefix):
-            count_candidates.append((q, c))
-            recency_candidates.append((q, hybrid_score(q)))
-    basic_top10 = [q for q, _ in heapq.nlargest(TOP_N, count_candidates, key=itemgetter(1))]
-    recency_top10 = [q for q, _ in heapq.nlargest(TOP_N, recency_candidates, key=itemgetter(1))]
-    return basic_top10, recency_top10
-
-
-def cache_recency_scan_result(prefix, top10_queries):
-    """Writes a freshly-scanned recency-mode result into recency_cache_servers.
-    Breaks the build-time alias with cache_servers first if it's still intact
-    (see _merge_update_recency_cache's docstring for why that's necessary)."""
-    server = ring.get_server(prefix)
-    if not server:
-        return
-    with cache_topology_lock:
-        if server not in recency_cache_servers:
-            return
-        if recency_cache_servers[server] is cache_servers.get(server):
-            recency_cache_servers[server] = dict(recency_cache_servers[server])
-        recency_cache_servers[server][prefix] = top10_queries
-
-
 def _enqueue_scan(prefix):
-    """Marks a prefix as needing a real scan at some point, without doing it
-    now. One shared queue for both caches - whichever one(s) still need
-    filling is re-checked independently at drain time in
-    background_scan_fill, not assumed from why this was enqueued. Dedup'd
-    via pending_scans_set so the same prefix never sits in the queue twice,
-    even if both _merge_update_cache and _merge_update_recency_cache enqueue
-    it in the same flush (the common case for a genuinely new prefix)."""
+    """Marks a prefix as needing a real scan of cache_servers at some point,
+    without doing it now. Dedup'd via pending_scans_set so the same prefix
+    never sits in the queue twice."""
     with scan_queue_lock:
         if prefix not in pending_scans_set:
             pending_scans_set.add(prefix)
@@ -165,7 +131,7 @@ def _enqueue_scan(prefix):
 
 def background_scan_fill():
     """Drains pending_scans forever, one prefix at a time: the only place
-    the expensive ~5.5ms compute_top10_both_via_scan actually runs for
+    the expensive ~5.5ms compute_top10_via_scan actually runs for
     queue-deferred misses. This keeps flush_buffer itself fast no matter
     how many never-cached prefixes one flush's changed_queries happen to
     touch - it only ever appends prefix names to the queue, it never scans.
@@ -174,9 +140,8 @@ def background_scan_fill():
     NOT blocked by it - main.py does its own scan immediately on a miss,
     independent of (and usually faster than) this background drain. So this
     worker only needs to "win the race" for prefixes nobody happens to ask
-    for live; the need_basic/need_recency checks below make that race
-    harmless either way - whichever side gets there first wins, the other
-    just skips, and only the side(s) still actually missing get written."""
+    for live; the already-cached check below makes that race harmless
+    either way - whichever side gets there first wins, the other skips."""
     while True:
         with scan_queue_lock:
             prefix = pending_scans.popleft() if pending_scans else None
@@ -188,19 +153,11 @@ def background_scan_fill():
             continue
 
         server = ring.get_server(prefix)
-        if not server:
-            continue
-
-        need_basic = cache_servers.get(server, {}).get(prefix) is None
-        need_recency = recency_cache_servers.get(server, {}).get(prefix) is None
-        if need_basic or need_recency:
-            basic_top10, recency_top10 = compute_top10_both_via_scan(prefix)
-            if need_basic:
-                with cache_topology_lock:
-                    if server in cache_servers:
-                        cache_servers[server][prefix] = basic_top10
-            if need_recency:
-                cache_recency_scan_result(prefix, recency_top10)
+        if server and cache_servers.get(server, {}).get(prefix) is None:
+            top10_queries = compute_top10_via_scan(prefix)
+            with cache_topology_lock:
+                if server in cache_servers:
+                    cache_servers[server][prefix] = top10_queries
 
         time.sleep(SCAN_WORKER_PACING_SLEEP_SECONDS)
 
@@ -250,13 +207,24 @@ def _merge_update_cache(prefix, changed_queries):
             cache_servers[server][prefix] = [q for q, _ in top10]
 
 
-def _merge_update_recency_cache(prefix, changed_queries):
-    """Same merge logic as _merge_update_cache, ranked by hybrid_score and
-    patching recency_cache_servers instead. The same correctness argument
-    applies: existing entries' relative count to each other can't change
-    without a write, so (old top10) union (changed queries) still covers the
-    true new top10 - decay's effect on RANKING (not membership) is handled
-    separately by background_decay_refresh."""
+def _merge_update_trending_cache(prefix, changed_queries):
+    """Updates the TRENDING list (recency_cache_servers) for a prefix - the
+    small, often-empty list of queries with currently-meaningful recency
+    activity. Unlike _merge_update_cache, there is no "existing is None"
+    scan-fallback branch here at all: an empty/missing trending list is
+    always a correct answer ("nothing is trending here right now"), never a
+    "missing data" state, because membership in this list is ENTIRELY
+    determined by actual search activity (changed_queries), which this
+    function always has direct access to.
+
+    Candidates considered: the prefix's existing trending members (might
+    still be trending) + whatever was just searched this flush. Anything
+    whose recency_score has decayed below RECENCY_PRUNE_THRESHOLD gets
+    dropped from the list entirely - this is the active pruning step that a
+    single merged hybrid_score list couldn't do safely (it had no way to
+    re-discover a stable-list query that got displaced). Here, nothing
+    needs "re-discovering": the stable list (cache_servers) never lost it
+    in the first place, and main.py merges both lists at serve time."""
     server = ring.get_server(prefix)
     if not server:
         return
@@ -264,42 +232,23 @@ def _merge_update_recency_cache(prefix, changed_queries):
     with cache_topology_lock:
         if server not in recency_cache_servers:
             return
-
-        # Break the build-time alias (see build_cache) the moment a real
-        # write needs to happen: recency_cache_servers[server] may still be
-        # the SAME dict object as cache_servers[server] (never copied, to
-        # save ~3M writes when nothing has diverged yet). Mutating it in
-        # place here would corrupt cache_servers too - replace it with a
-        # real independent copy first. Safe to keep sharing the unmodified
-        # entries' list objects, since neither side ever mutates a list in
-        # place - both only ever reassign a prefix's value wholesale.
-        if recency_cache_servers[server] is cache_servers.get(server):
-            recency_cache_servers[server] = dict(recency_cache_servers[server])
-
-        # This prefix now has at least one candidate with non-zero
-        # recency_score - the periodic refresh needs to know to re-sort it.
-        dirty_recency_prefixes.add(prefix)
-
-        existing = recency_cache_servers[server].get(prefix)
-
-    if existing is None:
-        # Same reasoning as _merge_update_cache's None branch: this prefix
-        # may have other already-existing, merely-uncommon matches that
-        # were never precomputed - defer the real scan to
-        # background_scan_fill instead of doing it inline here. Same shared
-        # queue as the basic side (_enqueue_scan dedups automatically if
-        # both sides enqueue the same prefix in this flush).
-        _enqueue_scan(prefix)
-        return
+        existing = recency_cache_servers.get(server, {}).get(prefix, [])
 
     candidates = {q: hybrid_score(q) for q in existing}
     for q in changed_queries:
         candidates[q] = hybrid_score(q)
 
-    top10 = heapq.nlargest(TOP_N, candidates.items(), key=itemgetter(1))
+    trending = [q for q in candidates if recency_memory.get(q, 0) > RECENCY_PRUNE_THRESHOLD]
+    new_top = [q for q, _ in heapq.nlargest(TOP_N, ((q, candidates[q]) for q in trending), key=itemgetter(1))]
+
     with cache_topology_lock:
         if server in recency_cache_servers:
-            recency_cache_servers[server][prefix] = [q for q, _ in top10]
+            if new_top:
+                recency_cache_servers[server][prefix] = new_top
+                dirty_recency_prefixes.add(prefix)
+            else:
+                recency_cache_servers[server].pop(prefix, None)
+                dirty_recency_prefixes.discard(prefix)
 
 
 def _decay_recency(query, current_tick):
@@ -361,7 +310,7 @@ def flush_buffer():
     # the side, in background_scan_fill.
     for prefix, changed_queries in prefix_to_changed.items():
         _merge_update_cache(prefix, changed_queries)
-        _merge_update_recency_cache(prefix, changed_queries)
+        _merge_update_trending_cache(prefix, changed_queries)
 
     clear_wal()
     print(
@@ -434,26 +383,23 @@ REFRESH_CHUNK_SIZE = 2000
 
 
 def refresh_recency_cache():
-    """Periodic re-sort of cached recency entries' EXISTING candidates, using
-    freshly decayed scores. No search involved, and none needed: decay only
-    ever moves a score DOWN (DECAY_FACTOR < 1), so a query that isn't already
-    sitting in a prefix's cached pool could never rise into it purely from
-    time passing - the only way a new contender enters a top10 is an actual
-    search, which the flush-time merge above already catches. This step only
-    needs to re-order what's already there.
+    """Periodic re-sort AND prune of the trending list's EXISTING members,
+    using freshly decayed scores. No new candidates are ever discovered
+    here (decay only moves scores DOWN, so nothing currently outside the
+    trending list could rise into it purely from time passing) - but
+    members already IN the list can and do fall below
+    RECENCY_PRUNE_THRESHOLD as they decay, and get dropped from the
+    trending list entirely. That's safe precisely because they're never
+    "lost" - the stable list (cache_servers) still has them, and main.py
+    merges both lists at serve time.
 
-    Only re-sorts dirty_recency_prefixes (prefixes actually touched by a real
-    search at some point) - NOT all ~3M cached prefixes. The vast majority
-    have zero live search activity, so every candidate's hybrid_score is just
-    0.01*count, which decay never changes the relative order of. Re-sorting
-    all of them on every tick was measured to cause a multi-second stall.
+    Only touches dirty_recency_prefixes (prefixes with a currently non-empty
+    trending list) - NOT all cached prefixes, which is the vast majority
+    with zero live search activity and an empty/absent trending entry.
 
     Processed in chunks, re-acquiring the lock between each: under heavy
-    search activity the dirty set can grow into the hundreds of thousands,
-    and holding the lock (blocking every /suggest and flush) for the whole
-    pass in one go was measured to stall live requests by several hundred
-    ms. Chunking trades one big stall for several much smaller ones, letting
-    other threads interleave in between."""
+    search activity the dirty set can grow large, and holding the lock for
+    one giant pass was measured to stall live requests by hundreds of ms."""
     prefixes = list(dirty_recency_prefixes)
     for i in range(0, len(prefixes), REFRESH_CHUNK_SIZE):
         chunk = prefixes[i : i + REFRESH_CHUNK_SIZE]
@@ -463,10 +409,17 @@ def refresh_recency_cache():
                 if not server or server not in recency_cache_servers:
                     continue
                 candidates = recency_cache_servers[server].get(prefix)
-                if candidates:
+                if not candidates:
+                    dirty_recency_prefixes.discard(prefix)
+                    continue
+                survivors = [q for q in candidates if recency_memory.get(q, 0) > RECENCY_PRUNE_THRESHOLD]
+                if survivors:
                     recency_cache_servers[server][prefix] = sorted(
-                        candidates, key=hybrid_score, reverse=True
+                        survivors, key=hybrid_score, reverse=True
                     )[:TOP_N]
+                else:
+                    recency_cache_servers[server].pop(prefix, None)
+                    dirty_recency_prefixes.discard(prefix)
 
 
 def background_decay_refresh():
@@ -505,13 +458,18 @@ def build_cache():
     Called on startup.
     1. Recover any unflushed searches from the WAL (crash recovery).
     2. Load all data from SQLite into frequency_memory/recency_memory.
-    3. Build BOTH caches bottom-up in one pass: start from complete queries
-       (the longest "prefix" of anything is the query itself), then walk one
-       character shorter at a time, merging each prefix's top 10 from its own
-       score (if it's itself a complete query) plus its children's already-
-       known top 10 lists - never rescanning the full dataset at any prefix.
-       cache_servers is ranked by count; recency_cache_servers by hybrid_score
-       - same merge, same pass, two independent rankings.
+    3. Build the STABLE list (cache_servers) bottom-up: start from complete
+       queries (the longest "prefix" of anything is the query itself), then
+       walk one character shorter at a time, merging each prefix's top 10
+       from its own score plus its children's already-known top 10 lists -
+       never rescanning the full dataset at any prefix. Single ranking only
+       (by count) - the TRENDING list (recency_cache_servers) needs no
+       precompute at all, since an empty trending list is always a correct
+       starting state (see module docstring).
+    4. Rebuild trending lists ONLY for queries with genuinely still-relevant
+       residual recency activity (recency_score > threshold) - cheap, since
+       on a fresh database this set is empty, and even after real traffic
+       it's a small fraction of the full dataset, not all ~300k queries.
     """
     recovered = replay_wal()
     if recovered:
@@ -529,24 +487,6 @@ def build_cache():
         print("Cache ready. 0 prefixes (empty dataset).")
         return
 
-    # Fast path: if no query has EVER been searched live, recency_score is 0
-    # for everyone, so hybrid_score = 0 + 0.01*count - a pure linear scaling
-    # of count. Sorting by hybrid_score then gives the IDENTICAL order to
-    # sorting by count, for every prefix, with no exceptions. So on a fresh
-    # database (the common case - first run, or any restart before real
-    # traffic), we skip computing a second ranking entirely and just copy
-    # the count-ranked lists into the recency cache - cutting build time
-    # roughly back to the single-ranking cost. Once real searches happen,
-    # this no longer holds (some queries now have non-zero recency_score),
-    # so the next restart correctly falls back to the full dual-ranking
-    # merge below.
-    fresh_start = all(v == 0 for v in recency_memory.values())
-
-    print(
-        "Building cache bottom-up (merging children prefixes upward)"
-        + (", fresh start - recency mirrors basic..." if fresh_start else "...")
-    )
-
     # Only the top TOP_N_PRECOMPUTE queries by count get a precomputed cache
     # entry - building all ~3M prefixes for the full dataset cost ~6.8s,
     # most of it for the long tail of rarely-searched queries that may never
@@ -562,6 +502,8 @@ def build_cache():
         else [q for q, _ in heapq.nlargest(TOP_N_PRECOMPUTE, frequency_memory.items(), key=itemgetter(1))]
     )
 
+    print("Building stable cache bottom-up (merging children prefixes upward)...")
+
     # Bucket queries by their own length so each one is injected as "the
     # complete word at this prefix" exactly once, at its own length - O(N)
     # total across the whole build, not re-scanned at every level.
@@ -571,81 +513,48 @@ def build_cache():
         length_buckets.setdefault(len(query), []).append(query)
         max_len = max(max_len, len(query))
 
-    next_level_count = {}    # prefix (length L+1) -> top10 [(query, count), ...]
-    next_level_recency = {}  # prefix (length L+1) -> top10 [(query, hybrid_score), ...] - unused if fresh_start
+    next_level_count = {}  # prefix (length L+1) -> top10 [(query, count), ...]
     total_prefixes = 0
 
-    if fresh_start:
-        # Lean single-ranking pass - the branch is hoisted OUTSIDE the loop
-        # entirely (checked once here, not 2.97M times inside it), and both
-        # caches are written from the SAME list object, no second ranking
-        # computed at all. This is the same shape as the original V1-only
-        # build, plus one extra (cheap) dict write per prefix for the second
-        # cache - measured to add ~0.9s for ~3M prefixes, not several
-        # seconds. Checking the branch inside the loop instead of hoisting
-        # it out here was measured to cost over a second extra by itself.
-        for length in range(max_len, MIN_PREFIX_LENGTH - 1, -1):
-            candidates_count = {}
-            for child_prefix, child_top10 in next_level_count.items():
-                candidates_count.setdefault(child_prefix[:length], []).extend(child_top10)
-            for query in length_buckets.get(length, []):
-                candidates_count.setdefault(query, []).append((query, frequency_memory[query]))
+    for length in range(max_len, MIN_PREFIX_LENGTH - 1, -1):
+        candidates_count = {}
+        for child_prefix, child_top10 in next_level_count.items():
+            candidates_count.setdefault(child_prefix[:length], []).extend(child_top10)
+        for query in length_buckets.get(length, []):
+            candidates_count.setdefault(query, []).append((query, frequency_memory[query]))
 
-            current_level_count = {}
-            for prefix in candidates_count:
-                top10_count = heapq.nlargest(TOP_N, candidates_count[prefix], key=itemgetter(1))
-                current_level_count[prefix] = top10_count
-                server = ring.get_server(prefix)
-                if server and server in cache_servers:
-                    cache_servers[server][prefix] = [q for q, _ in top10_count]
-                total_prefixes += 1
+        current_level_count = {}
+        for prefix in candidates_count:
+            top10_count = heapq.nlargest(TOP_N, candidates_count[prefix], key=itemgetter(1))
+            current_level_count[prefix] = top10_count
+            server = ring.get_server(prefix)
+            if server and server in cache_servers:
+                cache_servers[server][prefix] = [q for q, _ in top10_count]
+            total_prefixes += 1
 
-            next_level_count = current_level_count
-
-        # recency_cache_servers starts as a direct ALIAS of cache_servers
-        # (same dict objects, not copies) - zero extra writes for ~3M
-        # prefixes, since the two are byte-for-byte identical right now.
-        # The alias is broken (replaced with a real independent copy) the
-        # moment real search activity first causes genuine divergence - see
-        # _merge_update_recency_cache.
-        for server in cache_servers:
-            recency_cache_servers[server] = cache_servers[server]
-    else:
-        # Full dual-ranking pass - real search history exists, so the
-        # recency ranking can genuinely differ from the count ranking and
-        # must be computed for real.
-        for length in range(max_len, MIN_PREFIX_LENGTH - 1, -1):
-            candidates_count = {}
-            candidates_recency = {}
-            for child_prefix, child_top10 in next_level_count.items():
-                candidates_count.setdefault(child_prefix[:length], []).extend(child_top10)
-            for child_prefix, child_top10 in next_level_recency.items():
-                candidates_recency.setdefault(child_prefix[:length], []).extend(child_top10)
-            for query in length_buckets.get(length, []):
-                candidates_count.setdefault(query, []).append((query, frequency_memory[query]))
-                candidates_recency.setdefault(query, []).append((query, hybrid_score(query)))
-
-            current_level_count = {}
-            current_level_recency = {}
-            for prefix in candidates_count:
-                top10_count = heapq.nlargest(TOP_N, candidates_count[prefix], key=itemgetter(1))
-                top10_recency = heapq.nlargest(
-                    TOP_N, candidates_recency.get(prefix, []), key=itemgetter(1)
-                )
-                current_level_count[prefix] = top10_count
-                current_level_recency[prefix] = top10_recency
-
-                server = ring.get_server(prefix)
-                if server and server in cache_servers:
-                    cache_servers[server][prefix] = [q for q, _ in top10_count]
-                if server and server in recency_cache_servers:
-                    recency_cache_servers[server][prefix] = [q for q, _ in top10_recency]
-                total_prefixes += 1
-
-            next_level_count = current_level_count
-            next_level_recency = current_level_recency
+        next_level_count = current_level_count
 
     print(f"Cache ready. {total_prefixes} prefixes cached across {len(ring.servers)} servers.")
+
+    # Trending list rebuild: only needed across an unclean-ish restart where
+    # SOME queries still have meaningful (not yet decayed away) recency
+    # activity from before the restart. Scoped to just those queries - not
+    # the full dataset - since on a fresh database (the common case) this
+    # list is empty and the loop below does nothing at all.
+    trending_queries = [q for q in recency_memory if recency_memory[q] > RECENCY_PRUNE_THRESHOLD]
+    if trending_queries:
+        print(f"Rebuilding trending lists for {len(trending_queries)} queries with residual recency activity...")
+        prefix_candidates = {}
+        for query in trending_queries:
+            score = hybrid_score(query)
+            for prefix in get_prefixes(query):
+                prefix_candidates.setdefault(prefix, []).append((query, score))
+        for prefix, candidates in prefix_candidates.items():
+            top = [q for q, _ in heapq.nlargest(TOP_N, candidates, key=itemgetter(1))]
+            server = ring.get_server(prefix)
+            if server and server in recency_cache_servers:
+                recency_cache_servers[server][prefix] = top
+                dirty_recency_prefixes.add(prefix)
 
 
 def redistribute_cache():

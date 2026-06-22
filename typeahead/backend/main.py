@@ -24,8 +24,6 @@ from suggestions import (
     background_flush,
     background_scan_fill,
     build_cache,
-    cache_recency_scan_result,
-    compute_top10_recency_via_scan,
     compute_top10_via_scan,
     flush_buffer,
     get_current_tick,
@@ -74,18 +72,24 @@ def suggest(q: str = "", mode: str = "basic"):
     - If length < 3, return []
     - mode="basic" (default): cached (cache_servers), sorted by all-time
       count - V1 behavior, unchanged.
-    - mode="recency": V2 - cached (recency_cache_servers), sorted by
-      hybrid_score (recency + a count floor). Built/patched the same way as
-      basic mode, plus a periodic background re-sort to account for decay.
+    - mode="recency": V2 - merges TWO lists: the small "trending" list
+      (recency_cache_servers, queries with current recency activity) and
+      the "stable" list (cache_servers, by count), deduped, trending first.
+      A query that gets temporarily outranked and drops out of trending is
+      never lost - it's still sitting in the stable list the whole time,
+      and naturally resurfaces in the merge once the trending entry decays
+      below it (handled by background_decay_refresh pruning the trending
+      side - see suggestions.py).
     - Handles empty, mixed-case, no-match gracefully
 
-    Only the top TOP_N_PRECOMPUTE queries get a cache entry at startup (see
-    build_cache) - a prefix outside that set is a genuine miss the first
-    time anyone asks for it. We fall back to a linear scan (~5.5ms,
-    independent of dataset size growth in practice since it always scans
-    the same ~300k rows) and cache the result, so every subsequent request
-    for that same prefix is an instant hit afterward - this is a one-time
-    cost per distinct cold prefix, not a per-request one.
+    Only the top TOP_N_PRECOMPUTE queries get a stable-list cache entry at
+    startup (see build_cache) - a prefix outside that set is a genuine miss
+    the first time anyone asks for it. We fall back to a linear scan
+    (~5.5ms, independent of dataset size growth in practice since it always
+    scans the same ~300k rows) and cache the result, so every subsequent
+    request for that same prefix is an instant hit afterward - this is a
+    one-time cost per distinct cold prefix, not a per-request one. The
+    trending list never needs this fallback - empty is always correct.
     """
     q = q.lower().strip()
     if not q or len(q) < 3:
@@ -94,13 +98,26 @@ def suggest(q: str = "", mode: str = "basic"):
     server = ring.get_server(q)
 
     if mode == "recency":
-        cached = recency_cache_servers.get(server, {}).get(q)
-        if cached is not None:
-            return {"suggestions": cached, "server": server, "cache_hit": True, "mode": "recency"}
+        trending = recency_cache_servers.get(server, {}).get(q, [])
+        stable = cache_servers.get(server, {}).get(q)
+        cache_hit = stable is not None
 
-        suggestions = compute_top10_recency_via_scan(q)
-        cache_recency_scan_result(q, suggestions)
-        return {"suggestions": suggestions, "server": server, "cache_hit": False, "mode": "recency"}
+        if stable is None:
+            stable = compute_top10_via_scan(q)
+            with cache_topology_lock:
+                if server in cache_servers:
+                    cache_servers[server][q] = stable
+
+        seen = set(trending)
+        merged = list(trending)
+        for cand in stable:
+            if len(merged) >= 10:
+                break
+            if cand not in seen:
+                merged.append(cand)
+                seen.add(cand)
+
+        return {"suggestions": merged, "server": server, "cache_hit": cache_hit, "mode": "recency"}
 
     cached = cache_servers.get(server, {}).get(q)
 
