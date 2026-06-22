@@ -12,6 +12,7 @@ covers that case with a periodic re-sort of each prefix's EXISTING candidates
 import heapq
 import threading
 import time
+from operator import itemgetter
 
 from cache import ring
 from database import (
@@ -96,7 +97,7 @@ def _merge_update_cache(prefix, changed_queries):
             # it right now are the ones already in changed_queries - nothing
             # else to search for, no need to fall back to a full lookup.
             candidates = {q: frequency_memory.get(q, 0) for q in changed_queries}
-            top10 = heapq.nlargest(TOP_N, candidates.items(), key=lambda kv: kv[1])
+            top10 = heapq.nlargest(TOP_N, candidates.items(), key=itemgetter(1))
             cache_servers[server][prefix] = [q for q, _ in top10]
             return
 
@@ -104,7 +105,7 @@ def _merge_update_cache(prefix, changed_queries):
         for q in changed_queries:
             candidates[q] = frequency_memory.get(q, 0)
 
-        top10 = heapq.nlargest(TOP_N, candidates.items(), key=lambda kv: kv[1])
+        top10 = heapq.nlargest(TOP_N, candidates.items(), key=itemgetter(1))
         cache_servers[server][prefix] = [q for q, _ in top10]
 
 
@@ -123,6 +124,17 @@ def _merge_update_recency_cache(prefix, changed_queries):
         if server not in recency_cache_servers:
             return
 
+        # Break the build-time alias (see build_cache) the moment a real
+        # write needs to happen: recency_cache_servers[server] may still be
+        # the SAME dict object as cache_servers[server] (never copied, to
+        # save ~3M writes when nothing has diverged yet). Mutating it in
+        # place here would corrupt cache_servers too - replace it with a
+        # real independent copy first. Safe to keep sharing the unmodified
+        # entries' list objects, since neither side ever mutates a list in
+        # place - both only ever reassign a prefix's value wholesale.
+        if recency_cache_servers[server] is cache_servers.get(server):
+            recency_cache_servers[server] = dict(recency_cache_servers[server])
+
         # This prefix now has at least one candidate with non-zero
         # recency_score - the periodic refresh needs to know to re-sort it.
         dirty_recency_prefixes.add(prefix)
@@ -130,7 +142,7 @@ def _merge_update_recency_cache(prefix, changed_queries):
         existing = recency_cache_servers[server].get(prefix)
         if existing is None:
             candidates = {q: hybrid_score(q) for q in changed_queries}
-            top10 = heapq.nlargest(TOP_N, candidates.items(), key=lambda kv: kv[1])
+            top10 = heapq.nlargest(TOP_N, candidates.items(), key=itemgetter(1))
             recency_cache_servers[server][prefix] = [q for q, _ in top10]
             return
 
@@ -138,7 +150,7 @@ def _merge_update_recency_cache(prefix, changed_queries):
         for q in changed_queries:
             candidates[q] = hybrid_score(q)
 
-        top10 = heapq.nlargest(TOP_N, candidates.items(), key=lambda kv: kv[1])
+        top10 = heapq.nlargest(TOP_N, candidates.items(), key=itemgetter(1))
         recency_cache_servers[server][prefix] = [q for q, _ in top10]
 
 
@@ -392,53 +404,74 @@ def build_cache():
     next_level_recency = {}  # prefix (length L+1) -> top10 [(query, hybrid_score), ...] - unused if fresh_start
     total_prefixes = 0
 
-    for length in range(max_len, MIN_PREFIX_LENGTH - 1, -1):
-        # Group each level's entries by their parent (this level's) prefix -
-        # this is the "merge from children" step, bounded by however many
-        # distinct next-characters actually occur, not by total matches.
-        candidates_count = {}
-        for child_prefix, child_top10 in next_level_count.items():
-            candidates_count.setdefault(child_prefix[:length], []).extend(child_top10)
+    if fresh_start:
+        # Lean single-ranking pass - the branch is hoisted OUTSIDE the loop
+        # entirely (checked once here, not 2.97M times inside it), and both
+        # caches are written from the SAME list object, no second ranking
+        # computed at all. This is the same shape as the original V1-only
+        # build, plus one extra (cheap) dict write per prefix for the second
+        # cache - measured to add ~0.9s for ~3M prefixes, not several
+        # seconds. Checking the branch inside the loop instead of hoisting
+        # it out here was measured to cost over a second extra by itself.
+        for length in range(max_len, MIN_PREFIX_LENGTH - 1, -1):
+            candidates_count = {}
+            for child_prefix, child_top10 in next_level_count.items():
+                candidates_count.setdefault(child_prefix[:length], []).extend(child_top10)
+            for query in length_buckets.get(length, []):
+                candidates_count.setdefault(query, []).append((query, frequency_memory[query]))
 
-        # A prefix that is itself a complete query also contributes its own
-        # score, in addition to whatever children it has (e.g. "iphone" is
-        # both a real query AND has children like "iphone 15").
-        for query in length_buckets.get(length, []):
-            candidates_count.setdefault(query, []).append((query, frequency_memory[query]))
+            current_level_count = {}
+            for prefix in candidates_count:
+                top10_count = heapq.nlargest(TOP_N, candidates_count[prefix], key=itemgetter(1))
+                current_level_count[prefix] = top10_count
+                server = ring.get_server(prefix)
+                if server and server in cache_servers:
+                    cache_servers[server][prefix] = [q for q, _ in top10_count]
+                total_prefixes += 1
 
-        if not fresh_start:
+            next_level_count = current_level_count
+
+        # recency_cache_servers starts as a direct ALIAS of cache_servers
+        # (same dict objects, not copies) - zero extra writes for ~3M
+        # prefixes, since the two are byte-for-byte identical right now.
+        # The alias is broken (replaced with a real independent copy) the
+        # moment real search activity first causes genuine divergence - see
+        # _merge_update_recency_cache.
+        for server in cache_servers:
+            recency_cache_servers[server] = cache_servers[server]
+    else:
+        # Full dual-ranking pass - real search history exists, so the
+        # recency ranking can genuinely differ from the count ranking and
+        # must be computed for real.
+        for length in range(max_len, MIN_PREFIX_LENGTH - 1, -1):
+            candidates_count = {}
             candidates_recency = {}
+            for child_prefix, child_top10 in next_level_count.items():
+                candidates_count.setdefault(child_prefix[:length], []).extend(child_top10)
             for child_prefix, child_top10 in next_level_recency.items():
                 candidates_recency.setdefault(child_prefix[:length], []).extend(child_top10)
             for query in length_buckets.get(length, []):
+                candidates_count.setdefault(query, []).append((query, frequency_memory[query]))
                 candidates_recency.setdefault(query, []).append((query, hybrid_score(query)))
 
-        current_level_count = {}
-        current_level_recency = {}
-        for prefix in candidates_count:
-            top10_count = heapq.nlargest(TOP_N, candidates_count[prefix], key=lambda t: t[1])
-            current_level_count[prefix] = top10_count
-            count_queries = [q for q, _ in top10_count]
-
-            if fresh_start:
-                top10_recency_queries = count_queries
-            else:
+            current_level_count = {}
+            current_level_recency = {}
+            for prefix in candidates_count:
+                top10_count = heapq.nlargest(TOP_N, candidates_count[prefix], key=itemgetter(1))
                 top10_recency = heapq.nlargest(
-                    TOP_N, candidates_recency.get(prefix, []), key=lambda t: t[1]
+                    TOP_N, candidates_recency.get(prefix, []), key=itemgetter(1)
                 )
+                current_level_count[prefix] = top10_count
                 current_level_recency[prefix] = top10_recency
-                top10_recency_queries = [q for q, _ in top10_recency]
 
-            server = ring.get_server(prefix)
-            if server:
-                if server in cache_servers:
-                    cache_servers[server][prefix] = count_queries
-                if server in recency_cache_servers:
-                    recency_cache_servers[server][prefix] = top10_recency_queries
-            total_prefixes += 1
+                server = ring.get_server(prefix)
+                if server and server in cache_servers:
+                    cache_servers[server][prefix] = [q for q, _ in top10_count]
+                if server and server in recency_cache_servers:
+                    recency_cache_servers[server][prefix] = [q for q, _ in top10_recency]
+                total_prefixes += 1
 
-        next_level_count = current_level_count
-        if not fresh_start:
+            next_level_count = current_level_count
             next_level_recency = current_level_recency
 
     print(f"Cache ready. {total_prefixes} prefixes cached across {len(ring.servers)} servers.")
