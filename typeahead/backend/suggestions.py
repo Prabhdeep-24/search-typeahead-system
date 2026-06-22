@@ -27,10 +27,8 @@ from storage import (
     dirty_recency_prefixes,
     frequency_memory,
     last_tick_memory,
-    pending_basic_scans,
-    pending_basic_scans_set,
-    pending_recency_scans,
-    pending_recency_scans_set,
+    pending_scans,
+    pending_scans_set,
     recency_cache_servers,
     recency_memory,
     scan_queue_lock,
@@ -98,7 +96,12 @@ def compute_top10_via_scan(prefix):
     the scan always touches the full dataset regardless. Paid once per
     distinct cold prefix for the life of the process - the caller writes
     the result into the cache, so every subsequent request for the same
-    prefix is an instant hit afterward."""
+    prefix is an instant hit afterward.
+
+    Used directly by main.py's live basic-mode miss path, where only the
+    count ranking is needed. background_scan_fill uses
+    compute_top10_both_via_scan instead, since it usually needs both
+    rankings and they're cheaper to compute together."""
     matches = [(q, c) for q, c in frequency_memory.items() if q.startswith(prefix)]
     top10 = heapq.nlargest(TOP_N, matches, key=itemgetter(1))
     return [q for q, _ in top10]
@@ -106,10 +109,29 @@ def compute_top10_via_scan(prefix):
 
 def compute_top10_recency_via_scan(prefix):
     """Same fallback as compute_top10_via_scan, ranked by hybrid_score - used
-    for mode=recency misses."""
+    directly by main.py's live recency-mode miss path. hybrid_score is a
+    pure read of recency_memory/frequency_memory here, exactly like
+    everywhere else - this never decays or writes a recency score itself,
+    it only ranks by whatever the current value already is."""
     matches = [(q, hybrid_score(q)) for q in frequency_memory if q.startswith(prefix)]
     top10 = heapq.nlargest(TOP_N, matches, key=itemgetter(1))
     return [q for q, _ in top10]
+
+
+def compute_top10_both_via_scan(prefix):
+    """Like compute_top10_via_scan + compute_top10_recency_via_scan
+    combined into a single pass over frequency_memory, instead of scanning
+    the same ~300k records twice. Used by background_scan_fill, which
+    usually needs both rankings for the same never-cached prefix anyway."""
+    count_candidates = []
+    recency_candidates = []
+    for q, c in frequency_memory.items():
+        if q.startswith(prefix):
+            count_candidates.append((q, c))
+            recency_candidates.append((q, hybrid_score(q)))
+    basic_top10 = [q for q, _ in heapq.nlargest(TOP_N, count_candidates, key=itemgetter(1))]
+    recency_top10 = [q for q, _ in heapq.nlargest(TOP_N, recency_candidates, key=itemgetter(1))]
+    return basic_top10, recency_top10
 
 
 def cache_recency_scan_result(prefix, top10_queries):
@@ -127,66 +149,60 @@ def cache_recency_scan_result(prefix, top10_queries):
         recency_cache_servers[server][prefix] = top10_queries
 
 
-def _enqueue_basic_scan(prefix):
-    """Marks a prefix as needing a real scan (compute_top10_via_scan) at
-    some point, without doing the scan now. Dedup'd via pending_basic_scans_set
-    so the same prefix never sits in the queue twice even if multiple flushes
-    touch it before background_scan_fill catches up."""
+def _enqueue_scan(prefix):
+    """Marks a prefix as needing a real scan at some point, without doing it
+    now. One shared queue for both caches - whichever one(s) still need
+    filling is re-checked independently at drain time in
+    background_scan_fill, not assumed from why this was enqueued. Dedup'd
+    via pending_scans_set so the same prefix never sits in the queue twice,
+    even if both _merge_update_cache and _merge_update_recency_cache enqueue
+    it in the same flush (the common case for a genuinely new prefix)."""
     with scan_queue_lock:
-        if prefix not in pending_basic_scans_set:
-            pending_basic_scans_set.add(prefix)
-            pending_basic_scans.append(prefix)
-
-
-def _enqueue_recency_scan(prefix):
-    """Same as _enqueue_basic_scan, for the recency-mode scan queue."""
-    with scan_queue_lock:
-        if prefix not in pending_recency_scans_set:
-            pending_recency_scans_set.add(prefix)
-            pending_recency_scans.append(prefix)
+        if prefix not in pending_scans_set:
+            pending_scans_set.add(prefix)
+            pending_scans.append(prefix)
 
 
 def background_scan_fill():
-    """Drains pending_basic_scans/pending_recency_scans forever, one prefix
-    at a time: the only place the expensive ~5.5ms compute_top10_*_via_scan
-    actually runs for queue-deferred misses. This keeps flush_buffer itself
-    fast no matter how many never-cached prefixes one flush's changed_queries
-    happen to touch - it only ever appends prefix names here, it never scans.
+    """Drains pending_scans forever, one prefix at a time: the only place
+    the expensive ~5.5ms compute_top10_both_via_scan actually runs for
+    queue-deferred misses. This keeps flush_buffer itself fast no matter
+    how many never-cached prefixes one flush's changed_queries happen to
+    touch - it only ever appends prefix names to the queue, it never scans.
 
     A /suggest request for a prefix that's still waiting in this queue is
     NOT blocked by it - main.py does its own scan immediately on a miss,
     independent of (and usually faster than) this background drain. So this
     worker only needs to "win the race" for prefixes nobody happens to ask
-    for live; the already-cached check below makes that race harmless either
-    way - whichever side gets there first wins, the other just skips."""
+    for live; the need_basic/need_recency checks below make that race
+    harmless either way - whichever side gets there first wins, the other
+    just skips, and only the side(s) still actually missing get written."""
     while True:
-        did_work = False
-
         with scan_queue_lock:
-            prefix = pending_basic_scans.popleft() if pending_basic_scans else None
+            prefix = pending_scans.popleft() if pending_scans else None
             if prefix is not None:
-                pending_basic_scans_set.discard(prefix)
-        if prefix is not None:
-            did_work = True
-            server = ring.get_server(prefix)
-            if server and cache_servers.get(server, {}).get(prefix) is None:
-                top10_queries = compute_top10_via_scan(prefix)
+                pending_scans_set.discard(prefix)
+
+        if prefix is None:
+            time.sleep(SCAN_WORKER_IDLE_SLEEP_SECONDS)
+            continue
+
+        server = ring.get_server(prefix)
+        if not server:
+            continue
+
+        need_basic = cache_servers.get(server, {}).get(prefix) is None
+        need_recency = recency_cache_servers.get(server, {}).get(prefix) is None
+        if need_basic or need_recency:
+            basic_top10, recency_top10 = compute_top10_both_via_scan(prefix)
+            if need_basic:
                 with cache_topology_lock:
                     if server in cache_servers:
-                        cache_servers[server][prefix] = top10_queries
+                        cache_servers[server][prefix] = basic_top10
+            if need_recency:
+                cache_recency_scan_result(prefix, recency_top10)
 
-        with scan_queue_lock:
-            prefix = pending_recency_scans.popleft() if pending_recency_scans else None
-            if prefix is not None:
-                pending_recency_scans_set.discard(prefix)
-        if prefix is not None:
-            did_work = True
-            server = ring.get_server(prefix)
-            if server and recency_cache_servers.get(server, {}).get(prefix) is None:
-                top10_queries = compute_top10_recency_via_scan(prefix)
-                cache_recency_scan_result(prefix, top10_queries)
-
-        time.sleep(SCAN_WORKER_IDLE_SLEEP_SECONDS if not did_work else SCAN_WORKER_PACING_SLEEP_SECONDS)
+        time.sleep(SCAN_WORKER_PACING_SLEEP_SECONDS)
 
 
 def _merge_update_cache(prefix, changed_queries):
@@ -217,11 +233,11 @@ def _merge_update_cache(prefix, changed_queries):
         # answer here (unlike when every prefix was precomputed): there
         # could be other already-existing, merely-uncommon queries matching
         # this prefix that were never precomputed - the real answer needs a
-        # full scan (compute_top10_via_scan), which is too expensive to do
-        # inline for every one of potentially thousands of these per flush.
-        # Defer it to background_scan_fill instead - flush_buffer stays
-        # fast no matter how many never-cached prefixes it touches.
-        _enqueue_basic_scan(prefix)
+        # full scan, which is too expensive to do inline for every one of
+        # potentially thousands of these per flush. Defer it to
+        # background_scan_fill instead - flush_buffer stays fast no matter
+        # how many never-cached prefixes it touches.
+        _enqueue_scan(prefix)
         return
 
     candidates = {q: frequency_memory.get(q, 0) for q in existing}
@@ -270,8 +286,10 @@ def _merge_update_recency_cache(prefix, changed_queries):
         # Same reasoning as _merge_update_cache's None branch: this prefix
         # may have other already-existing, merely-uncommon matches that
         # were never precomputed - defer the real scan to
-        # background_scan_fill instead of doing it inline here.
-        _enqueue_recency_scan(prefix)
+        # background_scan_fill instead of doing it inline here. Same shared
+        # queue as the basic side (_enqueue_scan dedups automatically if
+        # both sides enqueue the same prefix in this flush).
+        _enqueue_scan(prefix)
         return
 
     candidates = {q: hybrid_score(q) for q in existing}
@@ -335,11 +353,11 @@ def flush_buffer():
 
     # Each call is fast: either a cheap in-memory merge (already-cached
     # prefixes - the vast majority of real traffic) or, for a never-cached
-    # prefix, just an O(1) append onto a queue (see _enqueue_basic_scan /
-    # _enqueue_recency_scan) - never an inline scan. This is what keeps
-    # flush_buffer itself fast regardless of how many distinct prefixes
-    # prefix_to_changed holds, or how many of those happen to be
-    # never-cached - the actual ~5.5ms scans for those happen later, off to
+    # prefix, just an O(1) append onto a queue (see _enqueue_scan) - never
+    # an inline scan. This is what keeps flush_buffer itself fast
+    # regardless of how many distinct prefixes prefix_to_changed holds, or
+    # how many of those happen to be never-cached - the actual ~5.5ms scans
+    # for those happen later, off to
     # the side, in background_scan_fill.
     for prefix, changed_queries in prefix_to_changed.items():
         _merge_update_cache(prefix, changed_queries)

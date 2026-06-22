@@ -56,19 +56,22 @@ last_tick_memory = {}
 # only needs to re-sort THIS set, not all ~3M entries (see suggestions.py).
 dirty_recency_prefixes = set()
 
-# Prefixes that have NEVER been cached (outside the precomputed top
-# TOP_N_PRECOMPUTE queries, never searched live either) and are waiting for
-# background_scan_fill to compute their real top10 via a full scan. A flush
-# only ever appends here - it never scans inline itself anymore, so a flush
-# whose changed_queries happen to touch many never-cached prefixes stays
-# fast no matter how many there are. A live /suggest request for one of
-# these prefixes is NOT blocked by this queue - it does its own scan
-# immediately and independently (see main.py); this queue only exists to
-# proactively fill in prefixes nobody has happened to ask for yet. The
-# *_set mirrors are for O(1) "already queued, don't enqueue twice" checks;
-# both pair (deque + set) are mutated together under scan_queue_lock.
-pending_basic_scans = deque()
-pending_basic_scans_set = set()
-pending_recency_scans = deque()
-pending_recency_scans_set = set()
+# Prefixes that are missing from cache_servers and/or recency_cache_servers
+# (outside the precomputed top TOP_N_PRECOMPUTE queries, never searched
+# live either) and are waiting for background_scan_fill to compute their
+# real top10 via a full scan. A single shared queue, not one per cache:
+# computing the count-ranked and hybrid-score-ranked top10 both require the
+# same scan over frequency_memory, so the worker does both in one pass
+# (compute_top10_both_via_scan) and writes whichever side(s) still need it
+# - re-checked at drain time, not assumed from whatever triggered the
+# enqueue. A flush only ever appends here - it never scans inline itself
+# anymore, so a flush whose changed_queries happen to touch many
+# never-cached prefixes stays fast no matter how many there are. A live
+# /suggest request for one of these prefixes is NOT blocked by this queue -
+# it does its own scan immediately and independently (see main.py); this
+# queue only exists to proactively fill in prefixes nobody has happened to
+# ask for yet. pending_scans_set is for O(1) "already queued, don't
+# enqueue twice" checks; the pair is mutated together under scan_queue_lock.
+pending_scans = deque()
+pending_scans_set = set()
 scan_queue_lock = threading.Lock()
