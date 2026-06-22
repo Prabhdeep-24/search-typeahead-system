@@ -22,6 +22,7 @@ from suggestions import (
     apply_global_decay,
     background_decay_refresh,
     background_flush,
+    background_scan_fill,
     build_cache,
     cache_recency_scan_result,
     compute_top10_recency_via_scan,
@@ -62,6 +63,7 @@ def startup():
     gc.freeze()
     threading.Thread(target=background_flush, daemon=True).start()
     threading.Thread(target=background_decay_refresh, daemon=True).start()
+    threading.Thread(target=background_scan_fill, daemon=True).start()
 
 
 @app.get("/suggest")

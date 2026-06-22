@@ -1,6 +1,7 @@
 """In-memory state. Everything here is derived from SQLite and safe to lose/rebuild on restart,
 except write_buffer (protected by the write-ahead log in wal.py)."""
 import threading
+from collections import deque
 
 # Sharded cache - each server is a Python dictionary
 # Key: prefix (str), Value: list of top 10 suggestions, ranked by all-time count
@@ -54,3 +55,20 @@ last_tick_memory = {}
 # candidate - decay never changes that relative order. The periodic refresh
 # only needs to re-sort THIS set, not all ~3M entries (see suggestions.py).
 dirty_recency_prefixes = set()
+
+# Prefixes that have NEVER been cached (outside the precomputed top
+# TOP_N_PRECOMPUTE queries, never searched live either) and are waiting for
+# background_scan_fill to compute their real top10 via a full scan. A flush
+# only ever appends here - it never scans inline itself anymore, so a flush
+# whose changed_queries happen to touch many never-cached prefixes stays
+# fast no matter how many there are. A live /suggest request for one of
+# these prefixes is NOT blocked by this queue - it does its own scan
+# immediately and independently (see main.py); this queue only exists to
+# proactively fill in prefixes nobody has happened to ask for yet. The
+# *_set mirrors are for O(1) "already queued, don't enqueue twice" checks;
+# both pair (deque + set) are mutated together under scan_queue_lock.
+pending_basic_scans = deque()
+pending_basic_scans_set = set()
+pending_recency_scans = deque()
+pending_recency_scans_set = set()
+scan_queue_lock = threading.Lock()
