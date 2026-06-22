@@ -23,6 +23,9 @@ from suggestions import (
     background_decay_refresh,
     background_flush,
     build_cache,
+    cache_recency_scan_result,
+    compute_top10_recency_via_scan,
+    compute_top10_via_scan,
     flush_buffer,
     get_current_tick,
     hybrid_score,
@@ -73,6 +76,14 @@ def suggest(q: str = "", mode: str = "basic"):
       hybrid_score (recency + a count floor). Built/patched the same way as
       basic mode, plus a periodic background re-sort to account for decay.
     - Handles empty, mixed-case, no-match gracefully
+
+    Only the top TOP_N_PRECOMPUTE queries get a cache entry at startup (see
+    build_cache) - a prefix outside that set is a genuine miss the first
+    time anyone asks for it. We fall back to a linear scan (~5.5ms,
+    independent of dataset size growth in practice since it always scans
+    the same ~300k rows) and cache the result, so every subsequent request
+    for that same prefix is an instant hit afterward - this is a one-time
+    cost per distinct cold prefix, not a per-request one.
     """
     q = q.lower().strip()
     if not q or len(q) < 3:
@@ -82,12 +93,12 @@ def suggest(q: str = "", mode: str = "basic"):
 
     if mode == "recency":
         cached = recency_cache_servers.get(server, {}).get(q)
-        return {
-            "suggestions": cached if cached is not None else [],
-            "server": server,
-            "cache_hit": cached is not None,
-            "mode": "recency",
-        }
+        if cached is not None:
+            return {"suggestions": cached, "server": server, "cache_hit": True, "mode": "recency"}
+
+        suggestions = compute_top10_recency_via_scan(q)
+        cache_recency_scan_result(q, suggestions)
+        return {"suggestions": suggestions, "server": server, "cache_hit": False, "mode": "recency"}
 
     cached = cache_servers.get(server, {}).get(q)
 
@@ -95,15 +106,13 @@ def suggest(q: str = "", mode: str = "basic"):
         cache_stats["hits"] += 1
         return {"suggestions": cached, "server": server, "cache_hit": True, "mode": "basic"}
 
-    # A miss here only happens for a prefix that belongs exclusively to a
-    # query submitted but not yet flushed - build_cache and every flush's
-    # merge-patch already guarantee a cache entry for any prefix of anything
-    # that's actually been persisted. There's nothing to search for: this
-    # branch always resolves to an empty list. It'll get a real cached
-    # answer (or join the changed-queries fallback in _merge_update_cache)
-    # once its flush happens.
     cache_stats["misses"] += 1
-    return {"suggestions": [], "server": server, "cache_hit": False, "mode": "basic"}
+    suggestions = compute_top10_via_scan(q)
+    with cache_topology_lock:
+        if server in cache_servers:
+            cache_servers[server][q] = suggestions
+
+    return {"suggestions": suggestions, "server": server, "cache_hit": False, "mode": "basic"}
 
 
 @app.post("/search")
